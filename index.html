@@ -134,6 +134,11 @@ details[open] summary{margin-bottom:10px}
     <div class="scanbox" id="scanBox" hidden>
       <p><b>스캔한 출석부가 있어요.</b> 사진으로 된 PDF라 글자를 바로 읽을 수 없어서, 각 강좌 아래에 원본 쪽 그림을 띄워 두었어요. 그림을 보고 날짜를 적어 주세요.</p>
       <p id="aiLine" hidden>또는 아래 버튼을 누르면 Claude가 그림에서 날짜(손글씨 포함)를 대신 읽어 칸을 채워 줍니다. 다 채운 뒤 원본과 한 번 비교해 주세요.</p>
+      <div class="row" id="keyRow" hidden>
+        <label class="field" style="flex:1;min-width:220px"><span>Claude API 키 (Anthropic Console에서 발급, sk-ant-로 시작)</span><input type="password" id="apiKey" autocomplete="off" placeholder="sk-ant-..."></label>
+        <label class="row" style="gap:6px;font-size:.85rem;align-self:flex-end;padding-bottom:6px"><input type="checkbox" id="rememberKey"> 이 브라우저에 기억</label>
+      </div>
+      <p class="hint" id="keyNote" hidden>키는 이 브라우저 안에만 두고, 원본 쪽 그림과 함께 Anthropic에만 보냅니다. 학교 공용 컴퓨터라면 '기억'을 끄세요. 사용한 만큼 키 주인의 계정에서 요금이 나갑니다(한 쪽에 대략 수십 원).</p>
       <div class="row"><button class="btn" id="aiRead" type="button" hidden>Claude로 날짜 읽기</button><span class="hint" id="aiStatus" aria-live="polite"></span></div>
     </div>
     <div class="courses" id="courses"></div>
@@ -448,8 +453,10 @@ function renderCourses(){
 function updateScanBox(){
   const scans = state.courses.filter(c=>c.blob);
   $("#scanBox").hidden = !scans.length;
-  const canAi = !!aiReady;
+  const standalone = !window.claude;   // GitHub Pages 등 일반 웹사이트
+  const canAi = !!aiReady || standalone;
   $("#aiLine").hidden = !canAi; $("#aiRead").hidden = !canAi;
+  $("#keyRow").hidden = !standalone; $("#keyNote").hidden = !standalone;
 }
 function renderFiles(){
   const tag = f => `<span class="tag ${f.status}">${f.status==="ok"?"읽음":f.status==="warn"?"확인 필요":f.status==="ex"?"예시":"오류"}</span>`;
@@ -516,9 +523,47 @@ const AI_PROMPT = `이 이미지는 학교 방과후학교 출석부의 한 쪽�
 날짜는 "월/일" 형식(예: "4/15")으로 적고, 읽기 애매한 날짜는 가장 그럴듯한 값을 적은 뒤 unsure 목록에도 넣어 주세요.
 다른 말 없이 JSON만 답하세요:
 {"courses":[{"title":"강좌명","teacher":"담당교사 이름","dates":["4/15","4/15"],"unsure":["4/24"]}]}`;
+const PAGE_SCHEMA = {type:"object", additionalProperties:false, required:["courses"], properties:{courses:{type:"array", items:{
+  type:"object", additionalProperties:false, required:["title","teacher","dates","unsure"],
+  properties:{title:{type:"string"}, teacher:{type:"string"}, dates:{type:"array",items:{type:"string"}}, unsure:{type:"array",items:{type:"string"}}}}}}};
+function blobToBase64(blob){ return new Promise((res,rej)=>{ const r=new FileReader(); r.onload=()=>res(String(r.result).split(",")[1]); r.onerror=rej; r.readAsDataURL(blob); }); }
+let apiClient = null, apiClientKey = "";
+async function readPageWithApiKey(blob){
+  const key = $("#apiKey").value.trim();
+  if (!key){ const e = new Error("no_key"); e.code="no_key"; throw e; }
+  if (!apiClient || apiClientKey !== key){
+    const { default: Anthropic } = await import("https://cdn.jsdelivr.net/npm/@anthropic-ai/sdk@1.6.0/+esm");
+    apiClient = new Anthropic({ apiKey: key, dangerouslyAllowBrowser: true }); apiClientKey = key;
+  }
+  const msg = await apiClient.beta.messages.create({
+    model: "claude-opus-5-5",
+    max_tokens: 16000,
+    betas: ["server-side-fallback-2026-07-01"],
+    fallbacks: "default",
+    output_config: { effort: "medium", format: { type: "json_schema", schema: PAGE_SCHEMA } },
+    messages: [{ role: "user", content: [
+      { type: "image", source: { type: "base64", media_type: "image/jpeg", data: await blobToBase64(blob) } },
+      { type: "text", text: AI_PROMPT }
+    ]}]
+  });
+  if (msg.stop_reason === "refusal"){ const e = new Error("refusal"); e.code="refusal"; throw e; }
+  const text = msg.content.filter(b=>b.type==="text").map(b=>b.text).join("");
+  return JSON.parse(text);
+}
+async function readPage(blob){
+  if (aiReady) return aiReady.json(AI_PROMPT, {images:[blob], modelTier:"default"});
+  return readPageWithApiKey(blob);
+}
+// 키 기억 (이 브라우저에만)
+try{ const k = localStorage.getItem("claudeApiKey"); if (k){ $("#apiKey").value = k; $("#rememberKey").checked = true; } }catch{}
+function saveKeyPref(){ try{ if ($("#rememberKey").checked && $("#apiKey").value.trim()) localStorage.setItem("claudeApiKey", $("#apiKey").value.trim()); else localStorage.removeItem("claudeApiKey"); }catch{} }
+$("#rememberKey").addEventListener("change", saveKeyPref);
+$("#apiKey").addEventListener("change", saveKeyPref);
 let aiBusy = false;
 $("#aiRead").addEventListener("click", async ()=>{
-  if (!aiReady || aiBusy) return;
+  if (aiBusy) return;
+  if (!aiReady && window.claude) return;
+  if (!aiReady && !$("#apiKey").value.trim()){ $("#aiStatus").textContent = "먼저 Claude API 키를 넣어 주세요."; $("#apiKey").focus(); return; }
   const targets = state.courses.filter(c=>c.blob && !parseDateList(c.dates).length);
   if (!targets.length){ $("#aiStatus").textContent = "날짜가 비어 있는 스캔본 쪽이 없습니다."; return; }
   aiBusy = true; $("#aiRead").disabled = true;
@@ -526,7 +571,7 @@ $("#aiRead").addEventListener("click", async ()=>{
   for (const c of targets){
     $("#aiStatus").textContent = `읽는 중… (${done+1}/${targets.length}쪽, 한 쪽에 10~40초 걸려요)`;
     try{
-      const out = await aiReady.json(AI_PROMPT, {images:[c.blob], modelTier:"default"});
+      const out = await readPage(c.blob);
       const list = Array.isArray(out?.courses) ? out.courses.filter(x=>Array.isArray(x.dates) && x.dates.length) : [];
       if (!list.length){ c.ai = "Claude가 이 쪽에서 날짜를 찾지 못했습니다. 그림을 보고 직접 적어 주세요."; failed++; }
       list.forEach((x,i)=>{
@@ -539,6 +584,11 @@ $("#aiRead").addEventListener("click", async ()=>{
     }catch(e){
       failed++;
       if (e?.code==="not_granted"){ $("#aiStatus").textContent = "Claude 사용을 허용하지 않아 멈췄습니다. 날짜를 직접 적어 주세요."; break; }
+      const st = e?.status;
+      if (st===401 || st===403){ $("#aiStatus").textContent = "API 키가 맞지 않아 멈췄습니다. 키를 다시 확인해 주세요."; break; }
+      if (st===400 && /credit|balance/i.test(e?.message||"")){ $("#aiStatus").textContent = "API 계정의 크레딧이 부족해 멈췄습니다. Anthropic Console에서 충전해 주세요."; break; }
+      if (st===429){ $("#aiStatus").textContent = "요청이 많아 잠시 멈췄습니다. 1분쯤 뒤 다시 눌러 주세요."; break; }
+      if (e?.message && /Failed to fetch|import/i.test(e.message) && !aiReady){ $("#aiStatus").textContent = "Claude에 연결하지 못해 멈췄습니다. 인터넷 연결을 확인해 주세요."; break; }
       if (e?.code==="rate_limited"){ $("#aiStatus").textContent = "요청이 많아 잠시 멈췄습니다. 조금 뒤 다시 눌러 주세요."; break; }
       c.ai = "이 쪽은 읽지 못했습니다. 그림을 보고 직접 적어 주세요.";
     }
