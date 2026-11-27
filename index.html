@@ -86,6 +86,10 @@ details[open] summary{margin-bottom:10px}
 .ws td{font-size:.85rem}
 .ws tr.off td{color:var(--muted);text-decoration:line-through}
 .empty{color:var(--muted);font-size:.9rem;padding:8px 0}
+.scanbox{border:1px solid var(--warn);background:var(--warn-soft);border-radius:8px;padding:12px 14px;display:flex;flex-direction:column;gap:8px}
+.scanbox p{color:var(--fg);font-size:.9rem}
+.pageimg{width:100%;border:1px solid var(--line);border-radius:6px;background:#fff}
+.course .ai{font-size:.8rem;color:var(--warn)}
 .toast{font-size:.85rem;color:var(--muted)}
 @media (prefers-reduced-motion:reduce){*{transition:none!important}}
 </style>
@@ -127,6 +131,11 @@ details[open] summary{margin-bottom:10px}
 
     <h3 style="margin-top:6px">강좌별 수업 날짜</h3>
     <p class="hint">날짜는 한 줄에 하나씩 또는 쉼표로 적습니다(예: 4/15, 04-20, 2026-05-06). 수업 시간을 적으면 조퇴·외출처럼 몇 시간짜리 근무상황은 시간이 겹칠 때만 문제로 표시합니다.</p>
+    <div class="scanbox" id="scanBox" hidden>
+      <p><b>스캔한 출석부가 있어요.</b> 사진으로 된 PDF라 글자를 바로 읽을 수 없어서, 각 강좌 아래에 원본 쪽 그림을 띄워 두었어요. 그림을 보고 날짜를 적어 주세요.</p>
+      <p id="aiLine" hidden>또는 아래 버튼을 누르면 Claude가 그림에서 날짜(손글씨 포함)를 대신 읽어 칸을 채워 줍니다. 다 채운 뒤 원본과 한 번 비교해 주세요.</p>
+      <div class="row"><button class="btn" id="aiRead" type="button" hidden>Claude로 날짜 읽기</button><span class="hint" id="aiStatus" aria-live="polite"></span></div>
+    </div>
     <div class="courses" id="courses"></div>
     <div class="row"><button class="btn ghost" id="addCourse" type="button">강좌 직접 추가</button></div>
 
@@ -342,7 +351,18 @@ async function parseAttendancePdf(buf, fname){
       courses.push({title: title || `${fname} ${p}쪽`, teacher, dates});
     });
   }
-  return {courses, scanned: !anyText};
+  const pages=[];
+  if (!anyText){
+    for (let p=1;p<=pdf.numPages;p++){
+      const page = await pdf.getPage(p); const vp = page.getViewport({scale: 1.6});
+      const cv = document.createElement("canvas"); cv.width = Math.round(vp.width); cv.height = Math.round(vp.height);
+      const ctx = cv.getContext("2d"); ctx.fillStyle="#fff"; ctx.fillRect(0,0,cv.width,cv.height);
+      await page.render({canvasContext: ctx, viewport: vp}).promise;
+      const blob = await new Promise(r=>cv.toBlob(r,"image/jpeg",0.85));
+      pages.push({blob, url: URL.createObjectURL(blob)});
+    }
+  }
+  return {courses, scanned: !anyText, pages};
 }
 
 /* ---------- 비교 ---------- */
@@ -419,8 +439,17 @@ function renderCourses(){
     <label class="field"><span>수업 시작 (선택)</span><input type="time" id="s${c.id}" data-k="start" value="${esc(c.start)}"></label>
     <label class="field"><span>수업 끝 (선택)</span><input type="time" id="e${c.id}" data-k="end" value="${esc(c.end)}"></label>
     <label class="field wide"><span>수업 날짜 (${parseDateList(c.dates).length}일) · 출처: ${esc(c.source)}</span><textarea id="d${c.id}" data-k="dates" rows="3" spellcheck="false">${esc(c.dates)}</textarea></label>
+    ${c.ai ? `<p class="wide ai">${esc(c.ai)}</p>` : ""}
+    ${c.img ? `<details class="wide" ${parseDateList(c.dates).length ? "" : "open"}><summary>원본 쪽 보기</summary><img class="pageimg" src="${c.img}" alt="${esc(c.source)} 원본"></details>` : ""}
     <div class="wide row"><button class="btn ghost" type="button" data-del="${c.id}">이 강좌 빼기</button></div>
   </div>`).join("");
+  updateScanBox();
+}
+function updateScanBox(){
+  const scans = state.courses.filter(c=>c.blob);
+  $("#scanBox").hidden = !scans.length;
+  const canAi = !!aiReady;
+  $("#aiLine").hidden = !canAi; $("#aiRead").hidden = !canAi;
 }
 function renderFiles(){
   const tag = f => `<span class="tag ${f.status}">${f.status==="ok"?"읽음":f.status==="warn"?"확인 필요":f.status==="ex"?"예시":"오류"}</span>`;
@@ -429,7 +458,7 @@ function renderFiles(){
   $("#exampleBanner").hidden = !state.example;
 }
 function datesToText(ds){ return ds.map(d=>`${d.getMonth()+1}/${d.getDate()}`).join(", "); }
-function addCourse(c){ state.courses.push({id:++cid, title:c.title||"", teacher:c.teacher||"", dates:c.dates||"", start:c.start||"", end:c.end||"", source:c.source||"직접 입력"}); }
+function addCourse(c){ state.courses.push({id:++cid, title:c.title||"", teacher:c.teacher||"", dates:c.dates||"", start:c.start||"", end:c.end||"", source:c.source||"직접 입력", img:c.img||"", blob:c.blob||null, ai:c.ai||""}); }
 function clearExample(){ if (state.example){ state.example=false; state.ws=[]; state.wsFile=null; state.courses=[]; state.atFiles=[]; } }
 function renderAll(){ renderFiles(); renderCourses(); renderWs(); runCheck(); }
 
@@ -452,8 +481,11 @@ async function handleAt(files){
   for (const file of files){
     try{
       if (/\.pdf$/i.test(file.name)){
-        const {courses, scanned} = await parseAttendancePdf(await file.arrayBuffer(), file.name);
-        if (scanned){ state.atFiles.push({name:file.name,status:"warn",msg:"스캔한 이미지 PDF라 글자를 읽을 수 없습니다. 아래 '강좌 직접 추가'로 날짜를 적어 주세요."}); addCourse({title:file.name.replace(/\.pdf$/i,""),source:file.name+" (직접 입력 필요)"}); }
+        const {courses, scanned, pages} = await parseAttendancePdf(await file.arrayBuffer(), file.name);
+        if (scanned){
+          state.atFiles.push({name:file.name,status:"warn",msg:`스캔본 ${pages.length}쪽: 글자를 바로 읽을 수 없어 쪽마다 날짜 칸을 만들었습니다. 2번 칸에서 날짜를 채워 주세요.`});
+          pages.forEach((pg,i)=>addCourse({title:`${file.name.replace(/\.pdf$/i,"")} ${i+1}쪽`, source:`${file.name} ${i+1}쪽 (스캔본)`, img: pg.url, blob: pg.blob}));
+        }
         else if (!courses.length){ state.atFiles.push({name:file.name,status:"warn",msg:"'날짜' 줄을 찾지 못했습니다. 날짜를 직접 적어 주세요."}); addCourse({title:file.name.replace(/\.pdf$/i,""),source:file.name}); }
         else { courses.forEach(c=>addCourse({...c,dates:datesToText(c.dates),source:file.name})); state.atFiles.push({name:file.name,status:"ok",msg:`강좌 ${courses.length}개, 수업일 ${courses.reduce((s,c)=>s+c.dates.length,0)}일`}); }
       } else {
@@ -466,6 +498,55 @@ async function handleAt(files){
   }
   renderAll();
 }
+
+/* ---------- 스캔본 날짜 읽기 (Claude 앱 안에서만) ---------- */
+let aiReady = null;
+(async ()=>{
+  try{
+    if (!window.claude?.use) return;
+    const sample = await window.claude.use("sample"); if (!sample) return;
+    const lim = await sample.limits().catch(()=>null); if (!lim?.images) return;
+    aiReady = sample; updateScanBox();
+  }catch{}
+})();
+const AI_PROMPT = `이 이미지는 학교 방과후학교 출석부의 한 쪽입니다.
+표마다 맨 위에 강좌명, 오른쪽 위에 "담당교사 : 이름"이 있고, 표 머리에 "차시" 행과 "날짜" 행이 있습니다.
+"날짜" 행에 적힌 수업 날짜(손글씨 포함)를 차시 순서대로 모두 읽어 주세요. 학생 이름과 출결 표시는 읽지 마세요.
+한 쪽에 표가 여러 개면 표마다 따로 적어 주세요.
+날짜는 "월/일" 형식(예: "4/15")으로 적고, 읽기 애매한 날짜는 가장 그럴듯한 값을 적은 뒤 unsure 목록에도 넣어 주세요.
+다른 말 없이 JSON만 답하세요:
+{"courses":[{"title":"강좌명","teacher":"담당교사 이름","dates":["4/15","4/15"],"unsure":["4/24"]}]}`;
+let aiBusy = false;
+$("#aiRead").addEventListener("click", async ()=>{
+  if (!aiReady || aiBusy) return;
+  const targets = state.courses.filter(c=>c.blob && !parseDateList(c.dates).length);
+  if (!targets.length){ $("#aiStatus").textContent = "날짜가 비어 있는 스캔본 쪽이 없습니다."; return; }
+  aiBusy = true; $("#aiRead").disabled = true;
+  let done = 0, failed = 0;
+  for (const c of targets){
+    $("#aiStatus").textContent = `읽는 중… (${done+1}/${targets.length}쪽, 한 쪽에 10~40초 걸려요)`;
+    try{
+      const out = await aiReady.json(AI_PROMPT, {images:[c.blob], modelTier:"default"});
+      const list = Array.isArray(out?.courses) ? out.courses.filter(x=>Array.isArray(x.dates) && x.dates.length) : [];
+      if (!list.length){ c.ai = "Claude가 이 쪽에서 날짜를 찾지 못했습니다. 그림을 보고 직접 적어 주세요."; failed++; }
+      list.forEach((x,i)=>{
+        const target = i===0 ? c : (addCourse({source:c.source, img:c.img, blob:c.blob}), state.courses[state.courses.length-1]);
+        target.title = clean(x.title) || target.title; target.teacher = clean(x.teacher) || target.teacher;
+        target.dates = x.dates.map(clean).join(", ");
+        const uns = (x.unsure||[]).map(clean).filter(Boolean);
+        target.ai = "Claude가 읽은 날짜입니다. 원본과 비교해 확인해 주세요." + (uns.length ? ` 특히 확인할 날짜: ${uns.join(", ")}` : "");
+      });
+    }catch(e){
+      failed++;
+      if (e?.code==="not_granted"){ $("#aiStatus").textContent = "Claude 사용을 허용하지 않아 멈췄습니다. 날짜를 직접 적어 주세요."; break; }
+      if (e?.code==="rate_limited"){ $("#aiStatus").textContent = "요청이 많아 잠시 멈췄습니다. 조금 뒤 다시 눌러 주세요."; break; }
+      c.ai = "이 쪽은 읽지 못했습니다. 그림을 보고 직접 적어 주세요.";
+    }
+    done++; renderCourses(); runCheck();
+  }
+  if (!/멈췄습니다/.test($("#aiStatus").textContent)) $("#aiStatus").textContent = `${done}쪽 중 ${done-failed}쪽을 읽었습니다. 각 강좌의 '원본 쪽 보기'와 비교해 확인해 주세요.`;
+  aiBusy = false; $("#aiRead").disabled = false; renderCourses();
+});
 
 /* ---------- 내보내기 ---------- */
 function toast(msg){ $("#toast").textContent = msg; }
